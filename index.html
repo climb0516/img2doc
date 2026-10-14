@@ -314,6 +314,7 @@
   .page-body p { margin: 0; }
   .page-body p:empty::before { content: "\200b"; }
   .page-body p[data-heading="1"] { text-align: center; font-weight: 700; }
+  .page-body p[data-align="right"] { text-align: right; }
   /* 两栏：先排满左栏再接右栏，溢出部分进入下一页 */
   .pages.two-col .page-body { column-count: 2; column-gap: var(--col-gap, 8mm); column-fill: auto; }
 
@@ -658,6 +659,72 @@
     }
   }
 
+  // 同一行被切成两段时，「一」这样只有一横的字常落在两段之间的空隙里被漏掉。
+  // 量空隙里最长的横线（以字宽为单位），用来补回「一」或「——」。
+  // a、b 为同一行相邻的两个文本框（OCR 坐标），返回 { line: 横线长度（字宽）, spread: 横带外墨迹占比 }，null 表示无法测量
+  const GAP_MAX_SPREAD = 0.25;   // 横带外墨迹占比上限，超过说明空隙里是别的字
+  function makeGapProbe(img, boxW, boxH) {
+    const sx = boxW ? img.w / boxW : 1;
+    const sy = boxH ? img.h / boxH : 1;
+    const pt = ([x, y]) => [x * sx, y * sy];
+    const at = (x, y) => {
+      x = Math.round(x); y = Math.round(y);
+      if (x < 0 || y < 0 || x >= img.w || y >= img.h) return 255;
+      return img.gray[y * img.w + x];
+    };
+    return (a, b, charW) => {
+      const [atl, atr, abr, abl] = a.box.map(pt);
+      const [btl, , , bbl] = b.box.map(pt);
+      const cw = charW * sx;
+      // 用左边文本框的像素算 Otsu 阈值（里面有字也有底色）
+      const hist = new Array(256).fill(0);
+      let count = 0;
+      const aw = Math.hypot(atr[0] - atl[0], atr[1] - atl[1]);
+      for (let s = 0; s < 1; s += 1 / Math.max(1, aw)) {
+        for (let v = 0; v <= 1; v += 0.05) {
+          hist[at(atl[0] + (atr[0] - atl[0]) * s + (abl[0] - atl[0]) * v, atl[1] + (atr[1] - atl[1]) * s + (abl[1] - atl[1]) * v)]++;
+          count++;
+        }
+      }
+      if (!count || !cw) return null;
+      // 「一」两端常较淡，阈值取 Otsu 阈值和底色（亮度中位数）的中间
+      const otsuThr = otsu(hist, count);
+      let acc = 0, bg = 255;
+      for (let i = 0; i < 256; i++) { acc += hist[i]; if (acc >= count / 2) { bg = i; break; } }
+      const thr = (otsuThr + Math.max(otsuThr, bg)) / 2;
+      // 空隙四边形：左框右边 → 右框左边，沿倾斜方向取像素。
+      // 文本框可能切掉「一」的两端，所以向两边各多量半个字宽；横线至少要有 0.3 个字宽落在空隙里
+      const gw = Math.hypot(btl[0] - atr[0], btl[1] - atr[1]);
+      if (gw < 1) return null;
+      const step = 0.5 / gw;
+      const m = (cw * 0.5) / gw;
+      let best = 0, bestV = 0;
+      const inkAt = [];   // 每个高度上，空隙内的深色像素数
+      for (let v = 0.05; v <= 0.95; v += 0.02) {
+        const x0 = atr[0] + (abr[0] - atr[0]) * v, y0 = atr[1] + (abr[1] - atr[1]) * v;
+        const x1 = btl[0] + (bbl[0] - btl[0]) * v, y1 = btl[1] + (bbl[1] - btl[1]) * v;
+        let start = null, ink = 0;
+        for (let s = -m; s <= 1 + m + step; s += step) {
+          const dark = s <= 1 + m && at(x0 + (x1 - x0) * s, y0 + (y1 - y0) * s) < thr;
+          if (dark && s >= 0 && s <= 1) ink++;
+          if (dark && start === null) start = s;
+          if (!dark && start !== null) {
+            const inside = (Math.min(s, 1) - Math.max(start, 0)) * gw;
+            const len = (s - start) * gw;
+            if (v >= 0.15 && v <= 0.85 && inside >= cw * 0.3 && len > best) { best = len; bestV = v; }
+            start = null;
+          }
+        }
+        inkAt.push([v, ink]);
+      }
+      // 「一」的墨迹集中在一条窄横带里；漏掉的其他字上下都有笔画，不算
+      const total = inkAt.reduce((n, [, k]) => n + k, 0);
+      const off = inkAt.reduce((n, [v, k]) => n + (Math.abs(v - bestV) > 0.15 ? k : 0), 0);
+      const spread = total ? off / total : 0;
+      return { line: best / cw, spread };
+    };
+  }
+
   // ---------- 分栏检测 ----------
   // PaddleOCR 会把左右两栏同一高度的文字检测成一行，所以识别前先在图片上找栏缝：
   // 在中间 30%~70% 宽度内按 -4°~4° 试斜线，穿过深色像素最少且足够宽的那条即为栏缝。
@@ -728,12 +795,22 @@
 
   // ---------- 版面分析 ----------
   // 把 PaddleOCR 的文本框整理成行：{ blanks, indent, text, heading }
-  function analyze(texts) {
+  // gapProbe：量同一行两段之间空隙里的横线，见 makeGapProbe
+  function analyze(texts, gapProbe) {
     const items = texts
       .filter(t => t.text && t.text.trim())
       .map(t => {
         const xs = t.box.map(p => p[0]), ys = t.box.map(p => p[1]);
-        return { text: t.text.trim(), x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys) };
+        // 省略号常被识别成「…….·」「··」等连续的点，统一成「……」
+        const text = t.text.trim().replace(/[.·…・]{2,}/g, '……');
+        // 中线（左右两边中点的连线）：照片倾斜时沿它延伸，判断别的文本框是否在同一行
+        const [tl, tr, br, bl] = t.box;
+        const lx = (tl[0] + bl[0]) / 2, ly = (tl[1] + bl[1]) / 2;
+        const rx = (tr[0] + br[0]) / 2, ry = (tr[1] + br[1]) / 2;
+        return {
+          text, box: t.box, x0: Math.min(...xs), x1: Math.max(...xs), y0: Math.min(...ys), y1: Math.max(...ys),
+          lx, ly, slope: rx - lx > 0 ? (ry - ly) / (rx - lx) : 0, h: ((bl[1] - tl[1]) + (br[1] - tr[1])) / 2,
+        };
       });
     if (!items.length) return [];
 
@@ -742,64 +819,119 @@
     const charW = (wide.length ? median(wide.map(i => (i.x1 - i.x0) / charUnits(i.text))) : 0) || lineH;
 
     // 同一水平位置的文本框合并成一行（多栏 / 表单）
-    items.sort((a, b) => a.y0 - b.y0);
-    const rows = [];
+    // 照片倾斜时外接矩形会变高，下一行开头的字容易落进去，所以沿倾斜的中线比较高度
+    const midAt = (it, x) => it.ly + it.slope * (x - it.lx);
+    const cxOf = (it) => (it.x0 + it.x1) / 2;
+    const textH = median(items.map(i => i.h)) || lineH;
+    const slope = wide.length ? median(wide.map(i => i.slope)) : 0;
+    // 短文本框算出的倾斜不准，以较宽的文本框为准，延伸到另一个文本框的中心
+    const rowGap = (row, it) => {
+      const ref = row.items.reduce((a, b) => (b.x1 - b.x0 > a.x1 - a.x0 ? b : a));
+      const [long, short] = ref.x1 - ref.x0 >= it.x1 - it.x0 ? [ref, it] : [it, ref];
+      return Math.abs(midAt(long, cxOf(short)) - midAt(short, cxOf(short)));
+    };
+    items.sort((a, b) => (midAt(a, cxOf(a)) - slope * cxOf(a)) - (midAt(b, cxOf(b)) - slope * cxOf(b)));
+    let rows = [];
     for (const it of items) {
-      const cy = (it.y0 + it.y1) / 2;
       const row = rows[rows.length - 1];
-      if (row && cy > row.y0 && cy < row.y1) row.items.push(it);
-      else rows.push({ y0: it.y0, y1: it.y1, items: [it] });
+      const gap = row ? rowGap(row, it) : Infinity;
+      const cy = (it.y0 + it.y1) / 2;
+      const oldSame = row && cy > row.y0 && cy < row.y1;
+      if (gap < textH * 0.5) {
+        row.items.push(it);
+        console.log(`[Row] 并入同一行 高度差 ${gap.toFixed(1)} / 行高 ${textH.toFixed(1)} ${it.text.slice(0, 10)}`);
+      } else {
+        if (oldSame) console.log(`[Row] 倾斜分开 高度差 ${gap.toFixed(1)} / 行高 ${textH.toFixed(1)} ${it.text.slice(0, 10)}`);
+        rows.push({ y0: it.y0, y1: it.y1, items: [it] });
+      }
     }
-    rows.forEach(r => {
+    const fit = (r) => {
       r.items.sort((a, b) => a.x0 - b.x0);
       r.x0 = r.items[0].x0;
       r.x1 = r.items[r.items.length - 1].x1;
+      r.y0 = Math.min(...r.items.map(it => it.y0));
+      r.y1 = Math.max(...r.items.map(it => it.y1));
+      return r;
+    };
+    rows.forEach(fit);
+
+    // 取附近几行的左右边界，抵消拍照倾斜。右边界看得远一些：开头几行可能都是短行（标题、称呼）
+    const near = (i, w) => rows.slice(Math.max(0, i - w), i + w + 1);
+    const bounds = (i) => ({
+      left: Math.min(...near(i, 2).map(n => n.x0)),
+      right: Math.max(...near(i, 5).map(n => n.x1)),
+    });
+    // 标题：较短、缩进不少于 2 字、大致居中、不以句末标点结尾
+    const isTitle = (text, x0, x1, { left, right }) => charUnits(text) <= 20
+      && x0 - left >= charW * 1.75
+      && Math.abs((x0 + x1) / 2 - (left + right) / 2) < charW * 3
+      && !/[。，；、,;]$/.test(text);
+
+    // 标题和其他文字高度相近被合成一行时（如标题略高于称呼），把标题拆成单独一行
+    rows = rows.flatMap((r, i) => {
+      if (r.items.length < 2) return [r];
+      const b = bounds(i);
+      const titles = r.items.filter(it => isTitle(it.text, it.x0, it.x1, b));
+      if (titles.length !== 1) return [r];
+      const t = fit({ items: titles });
+      const rest = fit({ items: r.items.filter(it => it !== titles[0]) });
+      return t.y0 <= rest.y0 ? [t, rest] : [rest, t];
     });
     const diffs = rows.slice(1).map((r, i) => r.y0 - rows[i].y0).filter(d => d > 0);
     const pitch = Math.max(lineH, diffs.length ? median(diffs) : lineH * 1.5);
 
-    const WINDOW = 2;   // 取前后各 2 行的左右边界，抵消拍照倾斜
     let prevY = null;
     return rows.map((r, i) => {
       const blanks = prevY === null ? 0 : Math.max(0, Math.min(5, Math.round((r.y0 - prevY) / pitch) - 1));
       prevY = r.y0;
-      const near = rows.slice(Math.max(0, i - WINDOW), i + WINDOW + 1);
-      const left = Math.min(...near.map(n => n.x0));
-      const right = Math.max(...near.map(n => n.x1));
+      const b = bounds(i);
+      const { left, right } = b;
       // 超过 0.75 个字宽才算 1 个字缩进，避免倾斜造成的半字偏移被误判
       const indent = Math.max(0, Math.floor((r.x0 - left) / charW + 0.25));
 
+      // 两段之间：空隙里有横线时补回漏掉的「一」「——」；正文里不到 3 个字宽的空隙直接连接；更宽的（表单）补全角空格
       let text = '';
       r.items.forEach((it, j) => {
         if (j) {
-          const gap = it.x0 - r.items[j - 1].x1;
-          if (gap > charW * 0.9) text += '　'.repeat(Math.round(gap / charW));
-          else if (gap > charW * 0.25 || (isLatin(text.slice(-1)) && isLatin(it.text[0]))) text += ' ';
+          const prev = r.items[j - 1];
+          const gap = it.x0 - prev.x1;
+          const probe = gap >= charW * 0.5 && gapProbe ? gapProbe(prev, it, charW) : null;
+          const line = probe && probe.spread < GAP_MAX_SPREAD ? probe.line : 0;
+          let fill;
+          if (line > DASH_MIN_RATIO) fill = '——';
+          else if (line >= 0.5) fill = '一';
+          else if (gap >= charW * 3) fill = '　'.repeat(Math.round(gap / charW));
+          else fill = isLatin(text.slice(-1)) && isLatin(it.text[0]) ? ' ' : '';
+          if (probe || gap >= charW * 3) {
+            console.log(`[Gap] ${prev.text.slice(-4)}|${it.text.slice(0, 4)} 空隙 ${(gap / charW).toFixed(2)} 字宽 横线 ${probe ? probe.line.toFixed(2) : '-'} 字宽 横带外墨迹 ${probe ? (probe.spread * 100).toFixed(0) + '%' : '-'} → ${fill ? `「${fill}」` : '直接连接'}`);
+          }
+          text += fill;
         }
         text += it.text;
       });
 
-      // 标题：单个文本框、较短、大致居中、不以句末标点结尾
-      const center = (r.x0 + r.x1) / 2;
-      const heading = r.items.length === 1
-        && charUnits(text) <= 20
-        && indent >= 2
-        && Math.abs(center - (left + right) / 2) < charW * 3
-        && !/[。，；、,;]$/.test(text);
+      const heading = r.items.length === 1 && isTitle(text, r.x0, r.x1, b);
+      // 从右半边开始、贴着右边界结束：落款、日期等靠右的行
+      const alignRight = !heading && r.x0 - left > (right - left) / 2 && right - r.x1 < charW * 1.5;
+      // 离右边界 2 个字以上就结束的行：这一段到此结束
+      const short = right - r.x1 > charW * 2;
 
-      return { blanks, indent, text, heading };
+      if (short || alignRight || heading) {
+        console.log(`[Layout] ${heading ? '标题' : alignRight ? '靠右' : '短行'} x ${r.x0.toFixed(0)}-${r.x1.toFixed(0)} 边界 ${left.toFixed(0)}-${right.toFixed(0)} 字宽 ${charW.toFixed(1)} ${text.slice(0, 12)}…${text.slice(-6)}`);
+      }
+      return { blanks, indent, text, heading, alignRight, short };
     });
   }
 
-  // 合并成段落：缩进行 / 空行 / 标题处断段，其余行接到上一段
+  // 合并成段落：缩进行 / 空行 / 标题 / 靠右的行 / 上一行是短行时断段，其余行接到上一段
   // 原图段首有缩进的，用两个全角空格保留
   const PARA_INDENT = '　　';
   function toMerged(rows) {
     const out = [];
     let cur = null;
     for (const r of rows) {
-      if (r.heading) {
-        out.push({ text: r.text, heading: true });
+      if (r.heading || r.alignRight) {
+        out.push(r.heading ? { text: r.text, heading: true } : { text: r.text, heading: false, align: 'right' });
         cur = null;
         continue;
       }
@@ -809,6 +941,7 @@
       } else {
         cur.text += (isLatin(cur.text.slice(-1)) && isLatin(r.text[0]) ? ' ' : '') + r.text;
       }
+      if (r.short) cur = null;
     }
     return out;
   }
@@ -952,7 +1085,7 @@
             } catch (err) {
               console.warn('[Dash] 破折号修正失败，保留原识别结果', err);
             }
-            const partRows = analyze(texts);
+            const partRows = analyze(texts, gray ? makeGapProbe(gray, resizedImageWidth, resizedImageHeight) : null);
             // 右栏第一行紧接左栏末尾，不插空行；没有缩进时会接到上一段
             if (pi > 0 && partRows.length) partRows[0].blanks = 0;
             rows.push(...partRows);
@@ -1001,10 +1134,11 @@
     return body;
   }
 
-  function makeP(text, heading, cont) {
+  function makeP(text, heading, cont, align) {
     const p = document.createElement('p');
     p.textContent = text;
     if (heading) p.dataset.heading = '1';
+    if (align) p.dataset.align = align;
     if (cont) p.dataset.cont = '1';
     return p;
   }
@@ -1016,8 +1150,8 @@
     pagesEl.innerHTML = '';
     let body = newPage();
 
-    for (const { text, heading } of paragraphs) {
-      let p = makeP(text, heading, false);
+    for (const { text, heading, align } of paragraphs) {
+      let p = makeP(text, heading, false, align);
       body.appendChild(p);
       if (!overflows(body)) continue;
 
@@ -1041,7 +1175,7 @@
         p.textContent = rest.slice(0, fit);
         rest = rest.slice(fit);
         body = newPage();
-        p = makeP(rest, heading, true);
+        p = makeP(rest, heading, true, align);
         body.appendChild(p);
       }
     }
@@ -1074,10 +1208,11 @@
         const raw = isEl ? (node.innerText || '') : node.textContent;
         const text = raw.replace(/​/g, '').replace(/\n$/, '');
         const heading = isEl && node.dataset.heading === '1';
+        const align = (isEl && node.dataset.align) || undefined;
         if (isEl && node.dataset.cont === '1' && result.length) {
           result[result.length - 1].text += text;
         } else {
-          text.split('\n').forEach(line => result.push({ text: line, heading }));
+          text.split('\n').forEach(line => result.push({ text: line, heading, align }));
         }
       });
     });
@@ -1098,12 +1233,12 @@
       renderPages();
     }, 0);
   });
-  // 在标题末尾回车时，新行不继承标题样式
+  // 在标题、靠右的行末尾回车时，新行不继承标题、靠右样式
   pagesEl.addEventListener('input', (e) => {
     if (e.inputType !== 'insertParagraph') return;
     const node = window.getSelection()?.anchorNode;
     const p = node && (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement)?.closest('p');
-    if (p && p.dataset.heading === '1' && !p.textContent.trim()) delete p.dataset.heading;
+    if (p && !p.textContent.trim()) { delete p.dataset.heading; delete p.dataset.align; }
   });
   // 编辑区粘贴：只保留纯文本
   pagesEl.addEventListener('paste', (e) => {
@@ -1286,9 +1421,9 @@
           },
           column: columns === 2 ? { count: 2, space: mm(COL_GAP_MM), equalWidth: true } : undefined,
         },
-        children: paragraphs.map(({ text, heading }) => new Paragraph({
+        children: paragraphs.map(({ text, heading, align }) => new Paragraph({
           spacing: { line: Math.round(240 * lh) },
-          alignment: heading ? AlignmentType.CENTER : undefined,
+          alignment: heading ? AlignmentType.CENTER : align === 'right' ? AlignmentType.RIGHT : undefined,
           children: [new TextRun({
             text,
             bold: heading,
