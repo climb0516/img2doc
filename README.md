@@ -15,7 +15,7 @@
 - **破折号修正**：自动把被误识别成「一」的「——」还原
 - **A4 分页预览**：按真实 A4 尺寸分页，可直接在纸上编辑；支持缩放
 - **排版调整**：单栏 / 两栏、字体（宋体 / 黑体 / 楷体）、字号、行距、上下 / 左右边距
-- **导出**：打印 / 存为 PDF、导出 Word（.docx，A4 纸张）、复制全文
+- **导出**：导出 PDF、导出 Word（.docx，A4 纸张）、打印、复制全文
 - **多图批量**：支持点击、拖拽、粘贴截图上传多张图片，可调整顺序
 
 ## 使用方法
@@ -23,13 +23,13 @@
 1. **上传图片**：点击选择、拖拽，或直接 ⌘V / Ctrl+V 粘贴截图
 2. **识别**：点「开始识别」。首次使用需下载约 30MB 的模型，之后浏览器会缓存
 3. **排版**：调整字体、字号、行距、边距；也可以直接点击纸张修改文字
-4. **导出**：右上角选择「打印 / PDF」「导出 Word」或「复制全文」
+4. **导出**：右上角点「导出」，选择「导出为 PDF」或「导出为 Word」；也可以「打印」或「复制全文」
 
-存为 PDF：在打印窗口中目标选「存储为 PDF」，纸张 A4，边距选「无」。
+「导出为 PDF」会把每页 A4 转成图片后生成 PDF，和页面效果完全一致，但文字不能选中、搜索，每页约几百 KB。需要文字可选的 PDF 时，点「打印」，在打印窗口中目标选「存储为 PDF」，纸张 A4，边距选「无」。
 
 ## 本地运行
 
-不需要构建，直接用 Chrome 打开 `index.html` 即可。识别模型和 Word 导出库从 jsDelivr CDN 加载，首次使用需要联网。
+不需要构建，直接用 Chrome 打开 `index.html` 即可。识别模型和 PDF / Word 导出库从 jsDelivr CDN 加载，首次使用需要联网。
 
 也可以起一个静态服务器：
 
@@ -120,6 +120,8 @@ npx esbuild entry.js --bundle --format=iife --minify --platform=browser --extern
 | [@techstark/opencv-js](https://github.com/TechStark/opencv-js) | 图像处理 | Apache-2.0 |
 | [js-clipper](https://sourceforge.net/projects/jsclipper/) | 文本框多边形处理 | Boost |
 | [docx](https://github.com/dolanmiu/docx) | 导出 Word | MIT |
+| [html2canvas](https://github.com/niklasvh/html2canvas) | 导出 PDF（页面转图片） | MIT |
+| [jsPDF](https://github.com/parallax/jsPDF) | 导出 PDF | MIT |
 
 ## 许可证
 

@@ -97,6 +97,25 @@
   .btn.block { width: 100%; height: 42px; font-size: 14px; }
   .btn:disabled { opacity: .55; cursor: not-allowed; transform: none; }
 
+  .dropdown { position: relative; }
+  .dropdown .caret { color: var(--text-3); margin-left: -2px; transition: transform .15s; }
+  .dropdown.open .caret { transform: rotate(180deg); }
+  .dropdown .menu {
+    display: none; position: absolute; top: calc(100% + 6px); right: 0; z-index: 50;
+    min-width: 150px; padding: 4px; background: #fff;
+    border: 1px solid var(--line); border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(15,23,42,.12);
+  }
+  .dropdown.open .menu { display: block; }
+  .menu-item {
+    display: flex; align-items: center; gap: 8px; width: 100%;
+    height: 34px; padding: 0 10px; border: none; border-radius: 7px;
+    background: transparent; color: var(--text-1);
+    font-size: 13px; font-weight: 500; cursor: pointer; text-align: left; white-space: nowrap;
+  }
+  .menu-item:hover { background: #f1f5f9; }
+  .menu-item svg { color: var(--text-2); }
+
   /* ---------- 主体 ---------- */
   .main { flex: 1; display: flex; min-height: 0; }
 
@@ -362,13 +381,26 @@
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
       复制全文
     </button>
-    <button class="btn" id="btnDocx">
-      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
-      导出 Word
-    </button>
+    <div class="dropdown" id="exportMenu">
+      <button class="btn" id="btnExport">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
+        <span>导出</span>
+        <svg class="caret" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <div class="menu">
+        <button class="menu-item" id="btnPdf">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+          导出为 PDF
+        </button>
+        <button class="menu-item" id="btnDocx">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M8 13h8M8 17h8"/></svg>
+          导出为 Word
+        </button>
+      </div>
+    </div>
     <button class="btn primary" id="btnPrint">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
-      打印 / PDF
+      打印
     </button>
   </div>
 </header>
@@ -1163,6 +1195,72 @@
     document.title = fileName();
     window.print();
     document.title = old;
+  });
+
+  // 导出菜单
+  const exportMenu = $('exportMenu');
+  $('btnExport').addEventListener('click', (e) => {
+    e.stopPropagation();
+    exportMenu.classList.toggle('open');
+  });
+  exportMenu.querySelector('.menu').addEventListener('click', () => exportMenu.classList.remove('open'));
+  document.addEventListener('click', (e) => { if (!exportMenu.contains(e.target)) exportMenu.classList.remove('open'); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') exportMenu.classList.remove('open'); });
+
+  // PDF 导出库首次使用时再加载
+  const loadScript = (src) => new Promise((resolve, reject) => {
+    const el = document.createElement('script');
+    el.src = src;
+    el.onload = resolve;
+    el.onerror = () => reject(new Error(`加载失败：${src}`));
+    document.head.appendChild(el);
+  });
+  let pdfLibs = null;
+  function loadPdfLibs() {
+    pdfLibs ||= Promise.all([
+      loadScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js'),
+      loadScript('https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js'),
+    ]).catch((e) => { pdfLibs = null; throw e; });
+    return pdfLibs;
+  }
+
+  // 每页 A4 截成图片，逐页放进 PDF
+  $('btnPdf').addEventListener('click', async () => {
+    collectFromPages();
+    if (!paragraphs.length) return toast('文档是空的', 'info');
+
+    const btn = $('btnExport');
+    const label = btn.querySelector('span');
+    btn.disabled = true;
+    label.textContent = '导出中…';
+    const oldZoom = zoom;
+    try {
+      try {
+        await loadPdfLibs();
+      } catch {
+        return toast('PDF 导出库加载失败，请检查网络后重试', 'info');
+      }
+      document.activeElement?.blur();
+      renderPages();
+      setZoom(1);
+      const pdf = new window.jspdf.jsPDF({ unit: 'mm', format: 'a4', compress: true });
+      const pages = pagesEl.querySelectorAll('.page');
+      for (let i = 0; i < pages.length; i++) {
+        label.textContent = `导出中 ${i + 1}/${pages.length}`;
+        const canvas = await html2canvas(pages[i], { scale: 2, backgroundColor: '#ffffff', logging: false });
+        if (i) pdf.addPage();
+        pdf.addImage(canvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, 210, 297);
+      }
+      pdf.save(`${fileName()}.pdf`);
+      toast('已导出 PDF');
+    } catch (e) {
+      console.error('[PDF]', e);
+      toast('PDF 导出失败', 'info');
+    } finally {
+      setZoom(oldZoom);
+      btn.disabled = false;
+      label.textContent = '导出';
+    }
   });
 
   $('btnDocx').addEventListener('click', async () => {
