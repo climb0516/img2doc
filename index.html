@@ -15,7 +15,6 @@
     --margin-v: 25mm;
     --margin-h: 20mm;
     --font-family: "Songti SC", "SimSun", "STSong", serif;
-    --indent: 0;
     --zoom: 1;
 
     /* 界面配色 */
@@ -293,10 +292,11 @@
     white-space: pre-wrap;
     color: #111;
   }
-  .page-body p { margin: 0; text-indent: var(--indent); }
+  .page-body p { margin: 0; }
   .page-body p:empty::before { content: "\200b"; }
-  .page-body p[data-cont="1"] { text-indent: 0; }
-  .page-body p[data-heading="1"] { text-align: center; font-weight: 700; text-indent: 0; }
+  .page-body p[data-heading="1"] { text-align: center; font-weight: 700; }
+  /* 两栏：先排满左栏再接右栏，溢出部分进入下一页 */
+  .pages.two-col .page-body { column-count: 2; column-gap: var(--col-gap, 8mm); column-fill: auto; }
 
   .empty-state {
     position: absolute; left: 0; right: 0; top: 0; height: 297mm;
@@ -398,14 +398,6 @@
         <div class="step">2</div>
         <div class="card-title">文字识别</div>
       </div>
-      <div class="field">
-        <div class="field-label">识别模式</div>
-        <div class="segmented" id="modeSeg">
-          <button data-value="layout" class="active">保留原排版</button>
-          <button data-value="merge">合并成段落</button>
-        </div>
-        <div class="field-desc" id="modeDesc"></div>
-      </div>
       <button class="btn primary block" id="btnRecognize">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2M17 3h2a2 2 0 0 1 2 2v2M21 17v2a2 2 0 0 1-2 2h-2M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/></svg>
         <span>开始识别</span>
@@ -418,6 +410,13 @@
       <div class="card-head">
         <div class="step">3</div>
         <div class="card-title">排版</div>
+      </div>
+      <div class="field">
+        <div class="field-label">分栏</div>
+        <div class="segmented" id="colSeg">
+          <button data-value="1" class="active">单栏</button>
+          <button data-value="2">两栏</button>
+        </div>
       </div>
       <div class="field">
         <div class="field-label">字体</div>
@@ -444,14 +443,6 @@
           <div class="field-label">左右边距 <b id="marginHVal"></b></div>
           <input type="range" id="marginH" min="10" max="40" step="1" value="20">
         </div>
-      </div>
-      <div class="field switch-row" id="autoFitRow">
-        字号适配原图行宽
-        <label class="switch"><input type="checkbox" id="autoFit" checked><span></span></label>
-      </div>
-      <div class="field switch-row">
-        首行缩进两字
-        <label class="switch"><input type="checkbox" id="indent"><span></span></label>
       </div>
     </section>
   </aside>
@@ -497,10 +488,6 @@
     hei:  { css: '"PingFang SC", "Heiti SC", "Microsoft YaHei", "SimHei", sans-serif', docx: '黑体' },
     kai:  { css: '"Kaiti SC", "STKaiti", "KaiTi", serif', docx: '楷体' },
   };
-  const MODE_DESC = {
-    layout: '按图片中的位置还原换行、空行、缩进和字间空隙，标题自动居中加粗。',
-    merge: '把同一段的多行合并成一个段落，排版随纸张自动换行，适合文章、书页。',
-  };
   const ICON = {
     up: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>',
     down: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>',
@@ -512,7 +499,7 @@
   // ---------- 状态 ----------
   const images = [];     // { id, file, url, status: 'pending'|'running'|'done'|'error' }
   let paragraphs = [];   // 文档内容：{ text, heading }，每项是一行 / 一段
-  let mode = 'layout';
+  let columns = 1;
   let fontKey = 'song';
   let zoom = 1;
   let ocrPromise = null;
@@ -639,6 +626,74 @@
     }
   }
 
+  // ---------- 分栏检测 ----------
+  // PaddleOCR 会把左右两栏同一高度的文字检测成一行，所以识别前先在图片上找栏缝：
+  // 在中间 30%~70% 宽度内按 -4°~4° 试斜线，穿过深色像素最少且足够宽的那条即为栏缝。
+  const GUTTER_MAX_RATIO = 0.1;    // 栏缝深色像素 / 普通位置中位数
+  const GUTTER_MIN_WIDTH = 0.012;  // 栏缝最小宽度（占图片宽度）
+
+  function detectGutter({ gray, w, h }) {
+    const hist = new Array(256).fill(0);
+    let n = 0;
+    for (let i = 0; i < gray.length; i += 4) { hist[gray[i]]++; n++; }
+    const thr = otsu(hist, n);
+    const y0 = Math.round(h * 0.05), y1 = Math.round(h * 0.95);
+    const xa = Math.round(w * 0.3), xb = Math.round(w * 0.7);
+
+    let best = null;
+    for (let deg = -4; deg <= 4; deg += 0.25) {
+      const k = Math.tan(deg * Math.PI / 180);
+      const counts = [];
+      for (let xc = xa; xc <= xb; xc++) {
+        let c = 0;
+        for (let y = y0; y < y1; y += 2) {
+          const x = Math.round(xc + (y - h / 2) * k);
+          if (x >= 0 && x < w && gray[y * w + x] < thr) c++;
+        }
+        counts.push(c);
+      }
+      let mi = 0;
+      counts.forEach((c, i) => { if (c < counts[mi]) mi = i; });
+      if (!best || counts[mi] < best.c) best = { c: counts[mi], mi, counts, k, deg, xc: xa + mi };
+    }
+
+    const med = median(best.counts);
+    // 栏缝要有一定宽度，排除单栏文字里偶然对齐的字间缝隙
+    const limit = Math.max(best.c, med * GUTTER_MAX_RATIO);
+    let l = best.mi, r = best.mi;
+    while (l > 0 && best.counts[l - 1] <= limit) l--;
+    while (r < best.counts.length - 1 && best.counts[r + 1] <= limit) r++;
+    const width = r - l + 1;
+    const isTwo = med >= 20 && best.c <= med * GUTTER_MAX_RATIO && width >= w * GUTTER_MIN_WIDTH;
+    const gutter = { xc: xa + (l + r) / 2, k: best.k };
+    console.log(`[Column] 栏缝 x=${gutter.xc.toFixed(0)} 角度 ${best.deg}° 深色 ${best.c}/${med} 宽 ${width}px → ${isTwo ? '两栏' : '单栏'}`);
+    return isTwo ? gutter : null;
+  }
+
+  // 沿栏缝把图片切成左右两张（另一半涂白），尺寸与原图一致，坐标系不变
+  async function splitImage(file, { xc, k }) {
+    const bmp = await createImageBitmap(file);
+    const w = bmp.width, h = bmp.height;
+    const xTop = xc - (h / 2) * k, xBottom = xc + (h / 2) * k;
+    const make = (keepLeft) => new Promise((resolve, reject) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(bmp, 0, 0);
+      ctx.fillStyle = '#fff';
+      ctx.beginPath();
+      if (keepLeft) { ctx.moveTo(xTop, 0); ctx.lineTo(w, 0); ctx.lineTo(w, h); ctx.lineTo(xBottom, h); }
+      else { ctx.moveTo(0, 0); ctx.lineTo(xTop, 0); ctx.lineTo(xBottom, h); ctx.lineTo(0, h); }
+      ctx.closePath();
+      ctx.fill();
+      canvas.toBlob(b => b ? resolve(URL.createObjectURL(b)) : reject(new Error('切分图片失败')), 'image/png');
+    });
+    const urls = [await make(true), await make(false)];
+    bmp.close();
+    return urls;
+  }
+
   // ---------- 版面分析 ----------
   // 把 PaddleOCR 的文本框整理成行：{ blanks, indent, text, heading }
   function analyze(texts) {
@@ -704,17 +759,9 @@
     });
   }
 
-  // 保留原排版：逐行输出，用全角空格还原缩进
-  function toLayout(rows) {
-    const out = [];
-    for (const r of rows) {
-      for (let i = 0; i < r.blanks; i++) out.push({ text: '', heading: false });
-      out.push({ text: r.heading ? r.text : '　'.repeat(r.indent) + r.text, heading: r.heading });
-    }
-    return out;
-  }
-
   // 合并成段落：缩进行 / 空行 / 标题处断段，其余行接到上一段
+  // 原图段首有缩进的，用两个全角空格保留
+  const PARA_INDENT = '　　';
   function toMerged(rows) {
     const out = [];
     let cur = null;
@@ -725,7 +772,7 @@
         continue;
       }
       if (!cur || r.indent >= 1 || r.blanks > 0) {
-        cur = { text: r.text, heading: false };
+        cur = { text: (r.indent >= 1 ? PARA_INDENT : '') + r.text, heading: false };
         out.push(cur);
       } else {
         cur.text += (isLatin(cur.text.slice(-1)) && isLatin(r.text[0]) ? ' ' : '') + r.text;
@@ -840,20 +887,45 @@
       setProgress(0, pending.length, '加载识别模型…');
       const ocr = await getOcr();
 
+      // 先检测分栏：有两栏图片时页面切到两栏
+      const prepared = new Map();
+      for (const img of pending) {
+        try {
+          const gray = await loadGray(img.file);
+          prepared.set(img, { gray, gutter: detectGutter(gray) });
+        } catch (err) {
+          console.warn('[Column] 分栏检测失败，按单栏识别', err);
+          prepared.set(img, { gray: null, gutter: null });
+        }
+      }
+      if ([...prepared.values()].some(p => p.gutter) && columns !== 2) {
+        setColumns(2);
+        toast('检测到两栏排版，已切换为两栏', 'info');
+      }
+
       for (let i = 0; i < pending.length; i++) {
         const img = pending[i];
+        const { gray, gutter } = prepared.get(img);
         img.status = 'running';
         updateThumb(img);
         setProgress(i, pending.length, `识别中 ${i + 1}/${pending.length}`);
+        const parts = gutter ? await splitImage(img.file, gutter).catch(() => [img.url]) : [img.url];
         try {
-          const { texts = [], resizedImageWidth, resizedImageHeight } = await ocr.detect(img.url);
-          try {
-            fixDashes(texts, await loadGray(img.file), resizedImageWidth, resizedImageHeight);
-          } catch (err) {
-            console.warn('[Dash] 破折号修正失败，保留原识别结果', err);
+          const rows = [];
+          for (let pi = 0; pi < parts.length; pi++) {
+            if (parts.length > 1) updateThumb(img, pi === 0 ? '识别左栏…' : '识别右栏…');
+            const { texts = [], resizedImageWidth, resizedImageHeight } = await ocr.detect(parts[pi]);
+            try {
+              if (gray) fixDashes(texts, gray, resizedImageWidth, resizedImageHeight);
+            } catch (err) {
+              console.warn('[Dash] 破折号修正失败，保留原识别结果', err);
+            }
+            const partRows = analyze(texts);
+            // 右栏第一行紧接左栏末尾，不插空行；没有缩进时会接到上一段
+            if (pi > 0 && partRows.length) partRows[0].blanks = 0;
+            rows.push(...partRows);
           }
-          const rows = analyze(texts);
-          const result = mode === 'layout' ? toLayout(rows) : toMerged(rows);
+          const result = toMerged(rows);
           if (paragraphs.length && result.length) paragraphs.push({ text: '', heading: false });   // 多张图之间空一行
           paragraphs.push(...result);
           img.status = 'done';
@@ -863,10 +935,10 @@
           console.error('[OCR]', err);
           img.status = 'error';
         }
+        parts.forEach(u => { if (u !== img.url) URL.revokeObjectURL(u); });
         updateThumb(img);
         setProgress(i + 1, pending.length, `识别中 ${Math.min(i + 2, pending.length)}/${pending.length}`);
       }
-      if (okCount) refit();
       const allOk = okCount === pending.length;
       toast(allOk ? `识别完成，共 ${okCount} 张` : `完成 ${okCount} 张，失败 ${pending.length - okCount} 张`, allOk ? 'ok' : 'info');
     } catch (err) {
@@ -905,7 +977,8 @@
     return p;
   }
 
-  const overflows = (body) => body.scrollHeight > body.clientHeight + 1;
+  // 单栏向下溢出；两栏排不下时会向右溢出成第三栏
+  const overflows = (body) => body.scrollHeight > body.clientHeight + 1 || body.scrollWidth > body.clientWidth + 1;
 
   function renderPages() {
     pagesEl.innerHTML = '';
@@ -1037,7 +1110,8 @@
     root.setProperty('--line-height', $('lineHeight').value);
     root.setProperty('--margin-v', `${$('marginV').value}mm`);
     root.setProperty('--margin-h', `${$('marginH').value}mm`);
-    root.setProperty('--indent', $('indent').checked ? '2em' : '0');
+    root.setProperty('--col-gap', `${COL_GAP_MM}mm`);
+    pagesEl.classList.toggle('two-col', columns === 2);
     syncSliderUI();
     if (rerender) {
       collectFromPages();
@@ -1045,66 +1119,24 @@
     }
   }
 
-  // 字号适配原图行宽：按最长一行的实际渲染宽度，算出刚好铺满纸张的字号
-  const MM_TO_PX = 96 / 25.4;
-  let measurer = null;
-  function fitFontSize() {
-    if (mode !== 'layout' || !$('autoFit').checked) return false;
-    const lines = paragraphs.filter(p => !p.heading && p.text.trim());
-    if (!lines.length) return false;
-    if (!measurer) {
-      measurer = document.createElement('span');
-      measurer.style.cssText = 'position:absolute;left:-99999px;top:0;visibility:hidden;white-space:pre;font-size:100px;';
-      document.body.appendChild(measurer);
-    }
-    measurer.style.fontFamily = FONTS[fontKey].css;
-    let maxW = 0;
-    for (const { text } of lines) {
-      measurer.textContent = text;
-      maxW = Math.max(maxW, measurer.getBoundingClientRect().width);
-    }
-    if (!maxW) return false;
-    const contentPx = (210 - 2 * $('marginH').value) * MM_TO_PX;
-    const pt = 100 * contentPx / maxW * 0.75 * 0.99;   // px → pt，留 1% 余量防止折行
-    const fitted = Math.min(24, Math.max(9, Math.floor(pt * 2) / 2));
-    console.log(`[AutoFit] 最长行 ${maxW.toFixed(0)}px@100px，版心 ${contentPx.toFixed(0)}px，字号 ${fitted}pt`);
-    $('fontSize').value = fitted;
-    return true;
-  }
-  function refit() {
-    if (fitFontSize()) applyStyle();
+  const COL_GAP_MM = 8;
+
+  function markSegmented(id, value) {
+    $(id).querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.value === String(value)));
   }
 
-  function syncModeUI() {
-    $('autoFitRow').style.display = mode === 'layout' ? '' : 'none';
+  function setColumns(n) {
+    columns = n;
+    markSegmented('colSeg', n);
+    applyStyle();
   }
 
-  bindSegmented('modeSeg', (v) => {
-    mode = v;
-    $('modeDesc').textContent = MODE_DESC[v];
-    // 保留原排版时缩进由空格还原，关闭首行缩进
-    $('indent').checked = v === 'merge';
-    syncModeUI();
-    applyStyle();
-  });
-  bindSegmented('fontSeg', (v) => {
-    fontKey = v;
-    collectFromPages();
-    fitFontSize();
-    applyStyle();
-  });
+  bindSegmented('colSeg', (v) => setColumns(Number(v)));
+  bindSegmented('fontSeg', (v) => { fontKey = v; applyStyle(); });
   ['fontSize', 'lineHeight', 'marginV', 'marginH'].forEach(id => {
     $(id).addEventListener('input', () => applyStyle(false));
-    $(id).addEventListener('change', () => {
-      collectFromPages();
-      if (id === 'marginH') fitFontSize();
-      applyStyle();
-    });
+    $(id).addEventListener('change', () => applyStyle());
   });
-  // 手动调字号时关闭自动适配
-  $('fontSize').addEventListener('input', () => { $('autoFit').checked = false; });
-  $('autoFit').addEventListener('change', () => { collectFromPages(); refit(); });
-  $('indent').addEventListener('change', () => applyStyle());
 
   // ---------- 缩放 ----------
   function setZoom(z) {
@@ -1143,7 +1175,6 @@
     const pt = parseFloat($('fontSize').value) || 12;
     const lh = parseFloat($('lineHeight').value) || 1.75;
     const font = FONTS[fontKey].docx;
-    const indent = $('indent').checked ? Math.round(pt * 20 * 2) : 0;
 
     const doc = new Document({
       sections: [{
@@ -1155,11 +1186,11 @@
               left: mm($('marginH').value), right: mm($('marginH').value),
             },
           },
+          column: columns === 2 ? { count: 2, space: mm(COL_GAP_MM), equalWidth: true } : undefined,
         },
         children: paragraphs.map(({ text, heading }) => new Paragraph({
           spacing: { line: Math.round(240 * lh) },
           alignment: heading ? AlignmentType.CENTER : undefined,
-          indent: indent && !heading ? { firstLine: indent } : undefined,
           children: [new TextRun({
             text,
             bold: heading,
@@ -1228,8 +1259,6 @@
   $('btnRecognize').addEventListener('click', recognizeAll);
 
   // ---------- 初始化 ----------
-  $('modeDesc').textContent = MODE_DESC[mode];
-  syncModeUI();
   applyStyle(false);
   renderPages();
 })();
