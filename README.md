@@ -21,6 +21,52 @@
 - **导出**：导出 PDF、导出 Word（.docx，A4 纸张）、打印、复制全文
 - **多图批量**：支持点击、拖拽、粘贴截图上传多张图片，可调整顺序
 
+## 技术架构
+
+纯前端单页，没有后端、没有数据库、没有定时任务；图片只在浏览器内存里处理，不上传。
+
+```
+用户选择 / 拖拽 / 粘贴图片（addFiles）
+  ↓ images[]（内存，状态 pending → running → done / error）
+点「开始识别」（recognizeAll）
+  ↓ getOcr()：首次从 jsDelivr 下载 PP-OCRv4 检测 / 识别模型 + 字典（约 30MB，浏览器缓存）
+  ↓ loadGray()：整图转灰度 → detectGutter() 找栏缝（有两栏就切到两栏排版）
+  ↓ 两栏：splitImage() 沿斜线切成左右两张，分别识别
+  ↓ ocr.detect()：vendor/paddle-ocr.js（@gutenye/ocr + onnxruntime-web WASM），逐个文本框识别
+  ↓ fixDashes()：「一」→「——」修正
+  ↓ analyze() + makeGapProbe()：文本框 → 行（缩进 / 空行 / 标题 / 靠右 / 短行 / 补字）
+  ↓ toMerged()：行 → 段落 paragraphs[]
+       ↓
+renderPages()：按 A4 分页渲染，可直接在纸上编辑（collectFromPages() 读回）
+  ├─ 导出 PDF：html2canvas（2 倍）→ jsPDF，每页一张 JPEG
+  ├─ 导出 Word：docx 库生成 .docx（A4，字体 / 字号 / 行距 / 边距照页面设置）
+  └─ 打印 / 复制全文
+```
+
+---
+
+## 前端
+
+- **技术栈**：原生 HTML + CSS + JS（单个 IIFE），无框架、无构建；所有逻辑在 `index.html`
+- **页面结构**：顶栏（标题、文件名 `#fileName`、复制全文、「导出」下拉菜单：导出 PDF / 导出 Word / 打印）；左侧栏三张卡片：图片列表（缩略图、调整顺序、删除、点开大图）、「开始识别」+ 总进度条、排版设置；右侧工作区：工具条（缩放 `setZoom()`、适应宽度、页数、清空）+ A4 纸张区 `#pages`
+- **排版设置**（`applyStyle()` 写 CSS 变量 `--font-family`、`--font-size`、`--line-height`、`--margin-v`、`--margin-h`、`--col-gap`）
+
+| 设置 | 范围 | 默认 |
+|------|------|------|
+| 栏数 | 单栏 / 两栏（`setColumns()`） | 单栏；检测到两栏图片时自动切两栏 |
+| 字体 | 宋体 / 黑体 / 楷体（`FONTS`） | 宋体 |
+| 字号 | 9–24 pt，步长 0.5 | 12 pt |
+| 行距 | 1–3，步长 0.05 | 1.75 |
+| 上下边距 | 10–40 mm | 25 mm |
+| 左右边距 | 10–40 mm | 20 mm |
+| 栏间距 | 固定 `COL_GAP_MM` | 8 mm |
+
+- **分页**：`renderPages()` 逐段放进当前页，`overflows()` 判断溢出后整段挪到下一页
+- **数据存储**：不用 localStorage / IndexedDB，识别结果只在内存（`images`、`paragraphs`），刷新页面就清空；模型文件由浏览器 HTTP 缓存
+- **kit 组件**：未使用
+
+---
+
 ## 使用方法
 
 1. **上传图片**：点击选择、拖拽，或直接 ⌘V / Ctrl+V 粘贴截图
@@ -43,6 +89,20 @@ python3 -m http.server 8000
 然后访问 http://localhost:8000
 
 ## 实现说明
+
+核心算法和阈值速查（都在 `index.html`）：
+
+| 步骤 | 函数 | 关键阈值 |
+|------|------|---------|
+| 灰度化 | `loadGray()` | 0.299R + 0.587G + 0.114B |
+| 自适应阈值 | `otsu()` | Otsu 法 |
+| 分栏检测 | `detectGutter()` | 中间 30%–70% 宽度，-4°～4° 步长 0.25°；`GUTTER_MAX_RATIO = 0.1`、`GUTTER_MIN_WIDTH = 0.012`，中位数深色像素 ≥ 20 才判 |
+| 切栏 | `splitImage()` | 沿斜线切，另一半涂白，坐标系不变 |
+| 破折号修正 | `fixDashes()` | 左右各 2.5 字宽、行高 15%–80%；`DASH_MIN_RATIO = 1.4` 字宽 |
+| 行内补字 | `makeGapProbe()` | 空隙 ≥ 0.5 字宽才量；横线 0.5–1.4 字宽补「一」、> 1.4 补「——」；`GAP_MAX_SPREAD = 0.25`；无横线时 ≥ 3 字宽补全角空格 |
+| 版面分析 | `analyze()` | 合并为一行：中线高度差 < 0.5 字高；缩进 `floor(偏移 / 字宽 + 0.25)`；空行最多 5 行；标题 ≤ 20 字、左缩进 ≥ 1.75 字宽、中心偏离 < 3 字宽；靠右离右边界 < 1.5 字宽；短行离右边界 > 2 字宽 |
+| 合并段落 | `toMerged()` | 标题 / 靠右单独成段；有缩进或空行开新段；英文之间补空格；段首缩进 `PARA_INDENT` |
+| 字宽计数 | `charUnits()` | 半角字符按 0.5 个字宽 |
 
 ### 段落还原
 
@@ -145,16 +205,16 @@ npx esbuild entry.js --bundle --format=iife --minify --platform=browser --extern
 
 ## 第三方依赖
 
-| 依赖 | 用途 | 许可证 |
-|---|---|---|
-| [@gutenye/ocr](https://github.com/gutenye/ocr) | PaddleOCR 浏览器封装 | MIT |
-| [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) PP-OCRv4 模型 | 文字检测与识别 | Apache-2.0 |
-| [onnxruntime-web](https://github.com/microsoft/onnxruntime) | 模型推理 | MIT |
-| [@techstark/opencv-js](https://github.com/TechStark/opencv-js) | 图像处理 | Apache-2.0 |
-| [js-clipper](https://sourceforge.net/projects/jsclipper/) | 文本框多边形处理 | Boost |
-| [docx](https://github.com/dolanmiu/docx) | 导出 Word | MIT |
-| [html2canvas](https://github.com/niklasvh/html2canvas) | 导出 PDF（页面转图片） | MIT |
-| [jsPDF](https://github.com/parallax/jsPDF) | 导出 PDF | MIT |
+| 依赖 | 版本 | 加载方式 | 用途 | 许可证 |
+|---|---|---|---|---|
+| [@gutenye/ocr](https://github.com/gutenye/ocr)（`@gutenye/ocr-browser`） | 1.4.9 | 打包进 `vendor/paddle-ocr.js` | PaddleOCR 浏览器封装 | MIT |
+| [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) PP-OCRv4 模型（`@gutenye/ocr-models`） | 1.4.2 | jsDelivr，`MODEL_BASE` | 文字检测与识别（`ch_PP-OCRv4_det_infer.onnx`、`ch_PP-OCRv4_rec_infer.onnx`、`ppocr_keys_v1.txt`） | Apache-2.0 |
+| [onnxruntime-web](https://github.com/microsoft/onnxruntime) | 1.30.0 | JS 打包进 vendor，WASM 从 jsDelivr 加载 | 模型推理 | MIT |
+| [@techstark/opencv-js](https://github.com/TechStark/opencv-js) | 未确认（随 @gutenye/ocr 依赖打包） | 打包进 vendor | 图像处理 | Apache-2.0 |
+| [js-clipper](https://sourceforge.net/projects/jsclipper/) | 未确认（随 @gutenye/ocr 依赖打包） | 打包进 vendor | 文本框多边形处理 | Boost |
+| [docx](https://github.com/dolanmiu/docx) | 8.5.0 | jsDelivr，页面加载时 | 导出 Word | MIT |
+| [html2canvas](https://github.com/niklasvh/html2canvas) | 1.4.1 | jsDelivr，第一次导出 PDF 时 | 导出 PDF（页面转图片） | MIT |
+| [jsPDF](https://github.com/parallax/jsPDF) | 2.5.1 | jsDelivr，第一次导出 PDF 时 | 导出 PDF | MIT |
 
 ## 许可证
 
